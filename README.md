@@ -1,478 +1,85 @@
-# SECOM 良率異常偵測
+# SECOM Yield Detection
 
-用 UCI SECOM 半導體製程資料建立不良批次偵測系統，並包成可呼叫的 API
-服務與 LLM 問答介面。**這個專案的重點是方法論的正確性與可解釋性，不是
-追求高分**——理由見下方「這個專案的立場」。
+A defect detection pipeline for semiconductor manufacturing data (UCI
+SECOM dataset): time-based data splitting, leakage-safe feature cleaning,
+two candidate models (XGBoost and IsolationForest), SHAP-based
+explainability, a FastAPI serving layer, and an optional local LLM agent
+for natural-language queries over the API.
 
-## 資料集
+## Overview
 
-[UCI SECOM](https://archive.ics.uci.edu/dataset/179/secom)：半導體產線
-的感測器量測紀錄。
+- **Dataset**: 1567 production lots, 590 anonymized sensor readings each,
+  ~6.6% defect (Fail) rate.
+- **Models**: XGBoost (supervised) and IsolationForest (unsupervised),
+  evaluated with time-series cross-validation — no random shuffling,
+  since the data is time-ordered production output.
+- **Explainability**: SHAP values for both per-instance and global
+  feature importance.
+- **Serving**: a FastAPI service exposing prediction and explanation
+  endpoints, backed by a trained model artifact.
+- **Agent**: an optional Ollama-based LLM agent that answers
+  natural-language questions by calling the API as tools.
 
-| 項目 | 數值 |
-|---|---|
-| 資料量 | 1567 列 × 592 欄 |
-| 特徵 | 590 個匿名感測器讀值（欄名就是 `0` ~ `589`，沒有語意說明） |
-| 標籤 | `Pass/Fail`，Fail 共 104 筆（6.64%） |
-| 缺失值 | 全表 41951 個 |
-| 時間欄 | `Time`，**只用於排序與切分，絕不當特徵** |
+## Results
 
-切分後：訓練集 1096 筆（Fail 89、8.12%）、測試集 471 筆（Fail 15、3.18%）。
+5-fold time-series cross-validation, evaluated against each fold's own
+random baseline:
 
-## 這個專案的立場
-
-這份資料的訊號本來就很弱，而且只有 104 筆不良品。在這種條件下，「做出漂
-亮的分數」跟「做出可信的流程」是兩件互相衝突的事，這個專案選擇後者：
-
-- **不調參追高分**。PR-AUC 落在 0.15 附近就是這份資料的現實。
-- **ROC-AUC > 0.9 會被當成警訊而不是成功**——那通常代表資料洩漏，要停下
-  來檢查，不是慶祝。
-- **所有依賴資料統計量的決定（砍哪些欄、補值中位數、判定閾值……）都在切
-  分之後、只從訓練集計算**。測試集直到方法全部定案前完全沒被碰過。
-- 每一個取捨都寫下理由，包含做錯後修正的過程（見文末「設計決策記錄」）。
-
-## 結果摘要
-
-5 折 TimeSeriesSplit 交叉驗證（全部在訓練集內完成，不碰測試集）：
-
-| 模型 | PR-AUC | 相對隨機基準線 | ROC-AUC |
-|---|---|---|---|
-| XGBoost（監督式） | 0.135 ± 0.051 | **1.53 倍**（5 折全部 > 1） | 0.535 ± 0.048 |
-| IsolationForest（非監督） | 0.102 ± 0.051 | 1.14 倍（5 折中 3 折 < 1） | 0.457 ± 0.082 |
-
-誠實的結論：
-
-- **XGBoost 訊號弱，但方向一致**——五折全部贏過隨機基準線，平均 1.53
-  倍。這不是一個「準」的分類器（ROC-AUC 0.535 離 0.8 以上的實用門檻很
-  遠），比較適合當人工複檢的排序輔助，不適合當自動判定系統。
-- **IsolationForest 在這份資料上等同無效**——ROC-AUC 平均 0.457 甚至低
-  於隨機（0.5）。保留它是為了示範「沒有標籤時的偵測方法長什麼樣」，
-  **不宣稱它有實用的偵測能力**。
-
-判定閾值 **0.5135**，是在「precision ≥ 20%」的條件下最大化 recall 選出來
-的，只用訓練集內部的驗證資料挑選，選定後才套用（詳見後面章節）。
-
-## 模型在看什麼：SHAP 全域解釋
+| Model | PR-AUC | ROC-AUC |
+|---|---|---|
+| XGBoost | 0.135 ± 0.051 | 0.535 ± 0.048 |
+| IsolationForest | 0.102 ± 0.051 | 0.457 ± 0.082 |
 
 ![SHAP summary plot](reports/figures/shap_summary.png)
 
-**怎麼讀這張圖**：
-
-- **Y 軸**：感測器欄號，由上到下按影響力排序（欄 21、59 影響最大）
-- **X 軸**：SHAP 值＝這個特徵把風險分數推高或拉低多少。中間灰線是 0，
-  往右＝推高風險（更可疑），往左＝拉低風險（更安全）
-- **每個點**：訓練集裡的一筆批次（每列 1096 個點）
-- **顏色**：紅＝該感測器在這筆的讀值高，藍＝讀值低
-
-看的訣竅是**顏色與左右位置的對應關係**：
-
-- **欄 21**：藍點在左、紅點在右 → 讀值越高，風險被推得越高
-- **欄 121**：藍點拖到很左邊（-0.20）→ 讀值特別低時會大幅拉低風險
-- **欄 146**：藍點跑到右邊 → 這欄是反過來的，讀值低反而推高風險
-
-橫向散佈越寬，代表該特徵影響力越大——這也是排序的依據。
-
-## 快速開始
-
-```bash
-# 0. 環境（Python 3.12），只需做一次
-conda activate secom
-pip install -r requirements.txt
-
-# 1. 訓練：產生 models/model.pkl 與 models/metadata.json
-#    同時印出交叉驗證結果與閾值選擇過程
-python src/train.py
-
-# 2.（選用）產生 SHAP 解釋與 reports/figures/shap_summary.png
-python src/explain.py
-
-# 3. 啟動 API 服務（會佔住這個終端機，關掉就停止服務）
-uvicorn src.api:app --reload
-#    開 http://127.0.0.1:8000/docs 可以用瀏覽器手動測試三個端點
-
-# 4.（另開一個終端機）看 API 的示範輸出
-python scripts/demo.py
-
-# 5.（另開一個終端機）用中文問問題，LLM 會自己去呼叫 API 查資料
-#    需要先安裝 Ollama 並 pull gemma4:e4b
-python src/agent.py
-
-# 測試（在專案根目錄執行）
-pytest
-```
-
-**注意**：步驟 1 必須先跑過，步驟 3~5 才能運作——`models/` 是訓練產物、
-不進 git，clone 下來時不存在。
-
-## 專案結構
+## Project Structure
 
 ```
 secom-yield-detection/
-├── CLAUDE.md                 # 專案規格書與方法論約束（見下方說明）
-├── requirements.txt          # 所有直接依賴都釘死版本（==）
-├── Dockerfile                # 未經實際建置驗證，見「已知限制」
-├── data/raw/                 # 原始 CSV（不進 git）
-├── models/                   # model.pkl + metadata.json（訓練產物，不進 git）
-├── notebooks/01_eda.ipynb    # 資料探索 + Time 欄時間倒退的偵錯過程
-├── reports/figures/          # SHAP summary plot
-├── scripts/demo.py           # 呼叫 API 的展示腳本
+├── requirements.txt        # Pinned dependency versions
+├── data/raw/                # Raw dataset (not tracked in git)
+├── models/                  # Trained model + metadata (not tracked in git)
+├── notebooks/01_eda.ipynb   # Exploratory data analysis
+├── reports/figures/         # Generated plots (e.g. SHAP summary)
+├── scripts/demo.py          # Demo script for the API
 ├── src/
-│   ├── data.py               # 載入、時間切分
-│   ├── features.py           # 清理 transformer（590 → 272 欄）
-│   ├── train.py              # 訓練、交叉驗證、閾值選擇、存模型
-│   ├── explain.py            # SHAP 解釋
-│   ├── api.py                # FastAPI：/health、/predict、/explain
-│   └── agent.py              # LLM agent（Ollama + 兩個工具）
-└── tests/                    # 三個測試：時間洩漏、補值來源、API 欄位數驗證
+│   ├── data.py               # Data loading and time-based split
+│   ├── features.py           # Leakage-safe cleaning transformer
+│   ├── train.py               # Training, cross-validation, threshold selection
+│   ├── explain.py             # SHAP explanations
+│   ├── api.py                 # FastAPI service
+│   └── agent.py               # LLM agent (Ollama + tool calling)
+└── tests/                     # Unit and integration tests
 ```
 
-## 七個階段各在做什麼
+## Getting Started
 
-| 階段 | 做什麼 | 產出 |
-|---|---|---|
-| 1. 載入與時間切分 | 按 `Time` 排序，前 70% 訓練、後 30% 測試。禁止隨機切分 | `src/data.py` |
-| 2. 清理 | 砍常數欄、缺失率 >50% 的欄、高相關重複欄，剩餘缺失用**訓練集**中位數補。590 → 272 欄 | `src/features.py` |
-| 3. 模型訓練 | IsolationForest（不用標籤）+ XGBoost（用標籤，早停決定樹數） | `src/train.py` |
-| 4. 評估 | PR-AUC 為主指標、跟每折自己的隨機基準線比較、選判定閾值 | `src/train.py` |
-| 5. SHAP 解釋 | 拆解單筆預測的特徵貢獻 + 全域 summary plot | `src/explain.py` |
-| 6. API 服務 | 三個端點，模型啟動時載入一次，附測試 | `src/api.py` |
-| 7. LLM agent | 使用者用中文提問，LLM 自主呼叫兩個工具查資料、寫報告 | `src/agent.py` |
+```bash
+# Install dependencies (Python 3.12)
+pip install -r requirements.txt
 
-**「幾折交叉驗證」是什麼**：想知道模型好不好，但不能用測試集（那是最後
-一次性驗收用的）。所以把**訓練資料自己**切成幾段，輪流拿一段當「假的測試
-集」評分。因為資料有時間順序，用的是 `TimeSeriesSplit`——只能拿過去訓練、
-未來驗證，不能反過來：
+# Train the model — produces models/model.pkl and models/metadata.json
+python src/train.py
 
-```
-折0：前 186 筆訓練 → 接下來 182 筆評分
-折1：前 368 筆訓練 → 接下來 182 筆評分
-...（訓練量遞增，共 5 折）
-```
+# (Optional) Generate SHAP explanations and the summary plot
+python src/explain.py
 
-跑 5 次取平均±標準差，就是「模型大概有多好」的估計，全程沒碰測試集。
+# Start the API server
+uvicorn src.api:app --reload
+# Interactive docs at http://127.0.0.1:8000/docs
 
-## 關於 CLAUDE.md
+# (Optional) Run the demo script against the running API
+python scripts/demo.py
 
-[`CLAUDE.md`](CLAUDE.md) 是這個專案的**規格書與方法論約束來源**，明訂了
-切分優先原則、每個階段的硬性規定（哪些參數不能調、哪些指標不能用、什麼
-情況要停下來檢查洩漏），以及「不追高分」的立場。它保留在 repo 裡，是因
-為這個專案的價值主要在方法論本身——把約束條件攤開來，才看得出結果是在什
-麼規則下產生的。
+# (Optional) Chat with the LLM agent (requires Ollama with a tool-calling model)
+python src/agent.py
 
-## 已知限制
-
-- **Dockerfile 從未實際建置驗證過**。開發機器沒有安裝 docker，這份
-  Dockerfile 是照規格附上的，語法未經 `docker build` 驗證，直接使用前請
-  自行測試。
-- **模型訊號弱，不適合當自動判定系統**。ROC-AUC 0.535 代表它比隨機好，
-  但遠不到可以取代人工判斷的程度；比較合理的定位是「有限的複檢預算下，
-  決定先看哪幾批」。
-- **`models/`、`data/raw/` 不進 git**，clone 下來要自己準備資料並執行
-  `python src/train.py` 才能啟動服務。
-- **同樣的程式碼在不同套件版本下會算出不同數字**（實測過），所以
-  `requirements.txt` 把版本全部釘死，詳見文末章節。
-
----
-
-# 設計決策記錄
-
-以下記錄每個需要額外說明理由、不適合塞進規格文件本身的調查結論與設計決
-定，包含做錯之後修正的過程。
-
-## 相關欄位保留規則
-
-CLAUDE.md 階段 2 步驟 3 移除相關係數 > 0.95 的欄位時，同一組裡只留一
-欄：**保留缺失率較低的那一欄；缺失率相同時保留欄號較小的**。
-
-- **缺失率優先**：兩欄承載的是同一份資訊，缺失較少的那一欄有更多真實
-  觀測值，補值依賴較低，留下它比較不會把「中位數猜測」當成真實訊號。
-- **欄號只是平手時的排序**：缺失率相同時沒有統計上的理由選誰，用欄號
-  純粹是為了讓結果可重現，不代表欄號較小的欄位比較重要。
-
-### 順帶修正：分組邏輯改用連通分量
-
-在實作這條規則時發現，原本判斷「兩欄是否算同一組」的方式（檢查欄位是
-否與**欄號比自己小**的欄位相關）只在鏈狀關係恰好按欄號遞增串起來時才
-正確，訓練集裡實測到一個反例：
-
-欄 `163, 164, 165, 298, 299, 300` 其實是同一組相關叢集（例如
-`163-298`=0.994、`164-299`=0.997、`165-300`=0.997），但 `163` 和
-`164` 兩者互相的相關係數只有 0.940（未過 0.95 門檻）。舊邏輯只檢查
-「比自己欄號小的」，`164` 因此沒發現自己跟整組間接相關，導致 `163`
-和 `164` 兩欄同時被保留下來——違背了「同一份重複資訊只留一份」的目的。
-
-修法是把「找出誰跟誰相關」與「同一組裡留哪一個」拆成兩步：先用連通分
-量（connected components）正確找出所有欄位分組，不管關係是否按欄號
-遞增排列，再對每一組套用上面的保留規則。這個修正跟這次的保留規則變更
-是同一段程式碼的自然結果，一併處理。
-
-## Time 欄位時間倒退
-
-原始檔按列序看，時間並非單調遞增：整份資料有 **6 個時間倒退點**，最
-大一次倒退達 264 天。逐一檢查後：
-
-- **已排除是解析問題**：原始字串（例如 `2008-07-19 11:55:00`）是無歧
-  義的 ISO 8601 格式（`YYYY-MM-DD HH:MM:SS`），`pd.to_datetime` 的
-  `dayfirst` 參數只影響 `DD/MM` 與 `MM/DD` 這類有歧義的格式，對此格式
-  不影響解析結果。
-- **推測是資料本身的真實結構**：現象很可能是 6 段各自依時間排序的區
-  塊被直接串接而成的檔案，而非單一連續時間序列。
-
-目前的處理方式維持不變：載入後用 stable sort 依 `Time` 統一重新排
-序，再切分訓練/測試集，不特別處理這 6 個區塊的邊界。
-
-完整的偵錯過程（包含用 `dayfirst` 參數排除解析歧義假設的實際程式碼與
-輸出）記錄在 [`notebooks/01_eda.ipynb`](notebooks/01_eda.ipynb)；這裡
-只放結論。
-
-## IsolationForest 的 contamination 設定
-
-`contamination=0.07` 是根據對這條產線不良率的**先驗認知**設定的超參
-數，不是從任何標籤估計出來的——包含測試集，也包含訓練集本身的實際
-Fail 比例（訓練集是 8.12%，跟 0.07 不同，這是刻意的：如果直接套用觀
-測到的比例，這個「非監督」方法就變相偷看了標籤，訓練集看到的比例也
-不保證等於部署後的真實比例）。
-
-沒有採用更「誠實」的替代方案（例如用某個驗證指標去調這個值），原因
-是：contamination 一旦開始用標籤去調，IsolationForest 就不再是一個
-獨立於監督式模型的訊號來源，等於把它退化成另一個要標籤的分類器，也
-就失去了拿它跟 XGBoost 互相對照的意義。
-
-## XGBoost 早停驗證集的資料處理
-
-`fit_xgboost_pipeline`（`src/train.py`）用訓練折尾端 20% 當早停驗證
-集，但 `SecomColumnCleaner` 是在**整個訓練折**（含這 20%）上 fit 的，
-不是只在前 80% 上 fit。
-
-這代表早停驗證集有輕微洩漏：它的資料影響了「哪些欄位被留下」與「補值
-用的中位數」這些統計量，等於早停驗證集在替自己的特徵表示打分，可能讓
-早停選出的樹數比嚴格做法略多。但**測試集完全乾淨**，不受影響——測試
-集的清理統計量從頭到尾都只來自訓練折，不管訓練折內部有沒有再切早停尾
-端；影響範圍僅止於超參數選擇（決定要長幾棵樹），不影響最終在測試集上
-量到的分數是否可信。
-
-**嚴格做法**是 cleaner 只 fit 內層 80% 再 refit：先用內層 80% fit
-cleaner，早停驗證集（尾端 20%）套用這個內層 cleaner 轉換、跑早停選出
-樹數；選定樹數後，再用整個訓練折重新 fit 一次 cleaner，並以選定的樹
-數重新訓練最終模型。這樣早停驗證集才真正做到「連清理統計量都沒看
-過」，跟測試集的待遇一致——代價是每折要多做一次完整的 fit。
-
-本專案為控制複雜度，選擇不做這個重新 fit 的步驟。
-
-## 5 折或 4 折：維持 5 折
-
-階段4的CV迴圈曾經分別用 `n_splits=5` 與 `n_splits=4` 各跑一次，比較
-兩組結果後決定維持 CLAUDE.md 原定的 5 折，不因為看到結果而更改設定。
-
-4折結果（供對照，不是正式採用的設定）：
-
-```
-TimeSeriesSplit(n_splits=4)：
-  折0: train=220 val=219  baseline=0.082  IsoForest=0.127(1.55x)  XGB=0.139(1.69x)
-  折1: train=439 val=219  baseline=0.132  IsoForest=0.196(1.48x)  XGB=0.128(0.97x)
-  折2: train=658 val=219  baseline=0.078  IsoForest=0.067(0.86x)  XGB=0.101(1.30x)
-  折3: train=877 val=219  baseline=0.064  IsoForest=0.074(1.15x)  XGB=0.149(2.32x)
-  IsoForest PR-AUC：0.116 ± 0.052（4/4折有效）
-  XGBoost   PR-AUC：0.129 ± 0.018（4/4折有效）
+# Run the test suite
+pytest
 ```
 
-5折結果（正式採用）：
+## Requirements
 
-```
-  IsoForest PR-AUC：0.102 ± 0.051（5/5折有效）
-  XGBoost   PR-AUC：0.135 ± 0.051（5/5折有效）
-```
-
-維持5折的理由：
-
-- **折數是事前指定的**（CLAUDE.md 原文寫 5 折）。看到兩組結果之後才
-  選比較好看的那一組，等於在挑對自己有利的評估設定，會讓「這個結果
-  可信」這件事失去意義——這正是這個專案最在乎的方法論正確性。
-- 兩者的PR-AUC平均值幾乎相同（XGBoost 0.135 vs 0.129，IsoForest
-  0.102 vs 0.116），差異在雜訊範圍內，不構成換設定的理由。
-- 4折標準差比較小（XGBoost 0.051→0.018），但這**主要是算術效果，
-  不是模型變穩定**：折數變少代表每折的驗證集變大（182→219筆），
-  PR-AUC 是從更多樣本估計出來的，抽樣誤差自然變小，跟模型本身的表
-  現無關。
-
-（以上數字皆為 `secom` 環境的實際輸出，理由見下方「套件版本會影響
-數字」一節。）
-
-## PR-AUC 必須相對於該折的基準線比較
-
-每折驗證集的正樣本比例差距很大（5折的 baseline 從 0.044 到 0.132，
-將近 3 倍），代表絕對 PR-AUC 數字沒辦法跨折直接比較——0.1 的 PR-AUC
-在 baseline 0.044 的折裡是 2.3 倍於隨機，在 baseline 0.132 的折裡卻
-不到隨機水準。`format_cv_report` 因此在每折都加了「PR-AUC / 該折
-baseline」這個倍數欄位，兩個模型跨 5 折的平均倍數：
-
-- **XGBoost：五折全部高於基準線，平均 1.53 倍**——訊號弱，但方向一
-  致，沒有任何一折輸給隨機基準線。
-- **IsolationForest：五折中有三折（折0、2、3）低於基準線，平均僅
-  1.14 倍**——在這個資料集上，這個設定的 IsolationForest 基本等同
-  無效，比隨機猜測好不了多少。保留它是為了示範不需要標籤的偵測方法
-  在這類資料上長什麼樣子，**不是宣稱它有實用的偵測能力**。
-
-## 閾值選擇為什麼不用跨折 pooled 的驗證折
-
-原本設想的做法是把 5 折 CV 各自的驗證折預測結果全部接起來
-（pooled），在合併後的資料上畫一條 PR 曲線挑閾值。實際算過後發現這
-樣做會讓 ROC-AUC 失真變低：
-
-- 跨折 pooled 算出來的 XGBoost ROC-AUC = 0.530（接近隨機的 0.5）
-- 但把每折自己的模型放在自己的驗證折上分別算 ROC-AUC，五折平均是
-  0.535 ± 0.048——比 pooled 的結果好，且每折都是內部一致的評分
-
-原因是 5 折 CV 訓練出的是 5 個各自獨立的 XGBoost 模型，
-`scale_pos_weight` 從 9.91 到 20.00 都不一樣，每個模型輸出的機率分數
-尺度並不保證能直接放在一起比較。把不同模型的分數硬接起來評分，混入
-的是「模型間尺度不一致」的雜訊，不是真正的訊號變弱。
-
-因此閾值選擇改用 **production 模型自己的早停驗證尾端**——
-`fit_xgboost_pipeline(X_train, y_train)`（在整個 70% 訓練集上 fit 的
-那個、真正會拿去部署的模型）內部本來就有一段 20% 的早停驗證集，這段
-資料對這個模型來說是完全沒看過的，且分數來自同一個模型、同一個尺
-度，不會有 pooled 方式的失真問題。這段驗證尾端的 ROC-AUC = 0.618，
-是目前看到最乾淨的訊號估計。
-
-代價：可用樣本數變少（219 筆，而非 pooled 的 910 筆），閾值選擇的統
-計穩定性比較低。這是刻意的取捨——寧可用小一點但乾淨的樣本，也不要
-用大一點但混雜著模型間尺度差異的樣本。
-
-## 閾值選擇與 confusion matrix（訓練集內部，尚未套用到測試集）
-
-在 precision >= 20%（CLAUDE.md 範例採用的門檻，且已確認在這份驗證尾
-端上可達）的條件下，從 production 模型的早停驗證尾端（219 筆，
-Fail=14）挑出讓 recall 最大的閾值：
-
-**閾值 = 0.5135**
-
-在同一段驗證尾端上的表現（這是訓練集內部的驗證資料，不是測試集；測
-試集要等這個閾值確認後才套用）：
-
-| 模型 | TP | FP | FN | TN | precision | recall |
-|---|---:|---:|---:|---:|---:|---:|
-| XGBoost（閾值=0.5135） | 5 | 19 | 9 | 186 | 0.208 | 0.357 |
-| IsolationForest（原生 contamination 判定） | 1 | 9 | 13 | 196 | 0.100 | 0.071 |
-
-在這個操作點上，XGBoost 抓到 219 筆裡 14 筆真實 Fail 中的 5 筆
-（recall=35.7%），代價是 19 筆假警報；IsolationForest 只抓到 1 筆
-（recall=7.1%），跟上面「等同無效」的結論一致。
-
-這個閾值（連同 `n_features`、`feature_names`、`scale_pos_weight`、產
-生當下的套件版本）由 `python train.py` 寫進 `models/metadata.json`，
-`src/api.py` 啟動時只讀這個檔案，程式碼裡不寫死任何訓練產物數字——
-重訓一次（甚至換一套套件版本重訓）之後，服務程式完全不用改。
-
-**限制**：這 219 筆早停驗證尾端被用來做了兩個決定——先用它決定
-`n_estimators`（早停），又用同一批資料的預測分數選閾值。閾值等於是在
-「模型已經看過、並據此調整過複雜度」的資料上挑出來的，不是完全獨立
-的一批驗證資料。上面 recall=0.357 這個數字因此可能略為樂觀，真正的
-泛化表現要看測試集上的結果。
-
-## SHAP：model_output 選擇與套件版本相容性
-
-`explain.py` 的 `TreeExplainer` 用 `feature_perturbation="interventional"`
-搭配 `model_output="probability"`，不是預設的 log-odds 空間。這樣
-`base_value` 與每個特徵的 `shap_value` 都落在機率空間，兩者加總直接等
-於模型自己的 `predict_proba`（已在訓練集上實測驗證，誤差約 3e-8）。
-`risk_score` 才因此有意義：它不只是另外報一個數字，而是 base_value 加
-上全部 SHAP 貢獻的加總。
-
-**版本相容性**：`shap` 舊版本（實測到 0.48.0 為止）無法解析 xgboost
-3.x 的模型序列化格式——`base_score` 在新格式裡存成 `"[5E-1]"` 這種帶中
-括號的字串，舊版 `shap` 的解析器會直接對這個字串呼叫 `float()` 而噴
-`ValueError`。用 `shap==0.51.0`（目前最新版）才能正確讀取。這代表
-`secom` env 裝 `shap` 時**不能用太舊的版本**，否則會在 `TreeExplainer`
-初始化階段就整個掛掉，不是能力不足的問題，而是純粹的版本相容性地雷。
-
-## XGBoost 的 predict_proba 不是校準過的真實機率
-
-SHAP 單筆解釋範例算出的 `base_value=0.3421`，遠高於訓練集實際的不良率
-8.12%。原因是 `scale_pos_weight=10.69`：這個權重刻意讓損失函數對正樣本
-（Fail）的懲罰放大約 10.7 倍，才能讓模型在嚴重類別不平衡下還願意預測
-少數類別，但代價是輸出的 `predict_proba` 分佈整體被推高，不再是「真的
-有 34.21% 機率會 Fail」這種可以直接對外宣稱的校準機率。
-
-**因此 `predict_proba` 的輸出只能當作排序分數（分數愈高愈可疑），不能
-當作真實機率使用**——這也是為什麼閾值選擇（見上面兩節）從頭到尾都是
-從 PR 曲線上依 precision 條件挑出來的，而不是套用預設的 0.5：0.5 這個
-數字在未校準的機率空間裡沒有「五五開」的意義，用它當閾值純屬巧合，不
-是有意義的操作點。
-
-## 套件版本會影響數字：`random_state=42` 保證的是什麼
-
-開發過程中發現，同一份 `train.py`、同一個 `random_state=42`，在兩個
-不同環境下重跑會得到不同的折 2、折 4 XGBoost PR-AUC，連帶選出不同的
-閾值（0.4838 對 0.5135）。一開始懷疑是 XGBoost 多執行緒下浮點數加總
-順序不固定，實測用 `n_jobs=8` 對抗 `n_jobs=1`、外加人工製造 CPU 排程
-競爭都無法重現差異，方向錯了。
-
-真正原因是兩個環境裝的套件版本完全不同：
-
-| 套件 | 一開始用來驗證的環境 | `secom`（本專案正式環境） |
-|---|---|---|
-| Python | 3.11.5 | 3.12.14 |
-| numpy | 1.24.3 | 2.5.2 |
-| pandas | 2.0.3 | 3.0.5 |
-| scipy | 1.11.1 | 1.18.0 |
-| scikit-learn | 1.3.0 | 1.9.0 |
-| xgboost | 3.2.0 | 3.3.0 |
-
-`random_state=42` 保證的是「同一套軟體版本、重跑會得到一樣的結果」，
-**不保證「不同版本的軟體重跑也會一樣」**：直方圖分箱、分裂點的
-tie-breaking、浮點運算細節都可能隨函式庫版本改變，而且改變的幅度不是
-均勻分布在每一折上（折 0、1、3 沒變，折 2、4 有變），單看「有沒有變」
-不容易判斷是真的不穩定還是版本差異。
-
-**本專案認定 `secom` 為唯一正式環境**，README 裡所有數字都是在
-`secom`（Python 3.12.14）下實際跑出來的。`requirements.txt` 把每個直
-接依賴都釘死版本（`==`，不用 `>=`），避免下一次在別的機器上裝出跟這裡
-不同的組合。閾值等訓練產物額外由 `models/metadata.json` 的
-`package_versions` 欄位記錄產生當下的實際版本，作為長期的溯源依據。
-
-## 階段7：LLM agent 的 tool calling 成功率——20 次實測
-
-`src/agent.py` 用本地 Ollama（`gemma4:e4b`）跑 20 個固定問題
-（`EVAL_QUESTIONS`，涵蓋不同批次、不同問法），逐一檢查 LLM 是否正確
-呼叫 `get_risk`/`get_contributors` 取得真實數字，而不是自己編答案。
-
-**結果：17/20 成功，成功率 85%，失敗率 15%**。
-
-失敗的 3 筆（lot=66、123、300）都是同一種模式：LLM 完全沒有呼叫任何
-工具，直接嘗試回答（`tools=[]`），違反系統提示詞「必須先用工具查詢、
-不能自己編數字」的規定。
-
-**失敗率 15% < CLAUDE.md 定的 30% 降級門檻，所以維持現有架構**：LLM
-繼續自主決定要不要呼叫工具、呼叫哪個、呼叫幾次，不需要改成「程式碼
-固定依序呼叫兩個 API、LLM 只負責寫報告」的降級版本。
-
-**這個 85% 本身是有雜訊的估計，不是精確值**：同一題在不同次執行可能
-得到不同結果——例如 `lot=20` 這一題，在某一次測試裡失敗、另一次測試
-裡卻成功，原因是本地 Ollama 沒有固定隨機種子，同樣的輸入每次生成的
-內容本來就不保證一樣。20 次測試因為過程中被使用者自己的互動測試打
-斷過一次，實際上分兩段跑完（前 5 題一段、後 15 題一段），但用的是同
-一份固定問題清單、同一套判定邏輯，結果仍然有效。
-
-**已經做但不算 CLAUDE.md 規定的「降級」的基本防護**：`run_agent` 呼叫
-Ollama 逾時或連不上時（`httpx.HTTPError`），會回傳一句誠實的「呼叫模
-型失敗」訊息，不會讓整個程式崩潰，也實測確認過 API 若連不上，LLM 收
-到工具回傳的錯誤後會照實說「查不到」，沒有編造數字。但這只是基本的
-錯誤處理，跟「架構性降級」是兩件不同的事。
-
-### 試過 `think=False` 加速，但因為成功率崩掉而放棄
-
-Ollama 這個模型預設會先輸出一大段內部推理過程才回答，是回應慢（單次
-常見 30 秒到 2 分鐘）的主因。Ollama 的 API 支援 `think: false` 關掉這
-段推理，實測單次回應能壓到約 1 秒。
-
-但用 `think: false` 重跑同一份 20 題測試，**成功率從 85% 崩到
-30%（6/20）**。失敗模式很一致：拿掉推理空間之後，模型對「使用者說的
-『批次47』該不該直接對應 `lot_index=47`」這種原本輕鬆的映射開始猶
-豫，反過來追問使用者要索引，而不是直接呼叫工具——例如：
-
-> 請問您指的「批次 47」是指測試集中的第幾筆資料索引（lot_index）呢？
-
-70% 失敗率遠超過 30% 的降級門檻。**結論：`think=False` 不採用，寧可
-慢也要保留推理**，`_call_ollama` 維持預設（不關閉 thinking）。這件事
-也說明一個道理：加速措施必須連著可靠性一起測，不能只看單次回應時間。
+- Python 3.12
+- All direct dependencies are pinned in `requirements.txt`
+- Ollama (only needed for `src/agent.py`)
