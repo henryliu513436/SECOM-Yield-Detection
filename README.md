@@ -32,6 +32,39 @@ random baseline:
 
 ![SHAP summary plot](reports/figures/shap_summary.png)
 
+## Modeling Approach
+
+**Feature cleaning** (590 → 272 features), fit on the training set only:
+1. Drop constant columns
+2. Drop columns with >50% missing values
+3. Drop highly correlated columns (|r| > 0.95, grouped via connected
+   components); within each group, keep the column with the lower
+   missing rate
+4. Impute remaining missing values with the training-set median
+
+**IsolationForest** (unsupervised): `contamination=0.07` is a fixed
+domain-prior hyperparameter, not estimated from labels.
+
+**XGBoost** (supervised): `binary:logistic` objective, `max_depth=3`,
+`scale_pos_weight` computed per fold from that fold's training-set
+class ratio, early stopping on the last 20% of the training fold
+(minimum 50 rows) with `early_stopping_rounds=20` and
+`eval_metric="aucpr"`. Training is single-threaded (`n_jobs=1`) —
+multi-threaded histogram building was found to produce run-to-run
+variance in the selected number of trees.
+
+**Cross-validation**: `TimeSeriesSplit`, 5 folds — no random shuffling,
+since production lots are time-ordered.
+
+**Threshold selection**: chosen from the production model's own
+held-out early-stopping tail (never the test set), maximizing recall
+subject to precision ≥ 20% on the precision-recall curve.
+
+**SHAP**: `TreeExplainer` with interventional feature perturbation and
+probability-space output, so that `base_value + Σ shap_value` equals
+the model's own `predict_proba` output. Background dataset is the
+training set.
+
 ## Project Structure
 
 ```
