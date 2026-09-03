@@ -6,6 +6,7 @@ train.fit_xgboost_pipeline），背景資料集是同一份訓練集，不碰測
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,6 +19,10 @@ import numpy as np
 import pandas as pd
 import shap
 from sklearn.pipeline import Pipeline
+
+# data.py/train.py 用平行匯入、不是套件相對匯入，這行讓本檔案不論從
+# 專案根目錄或從 src/ 本身執行都找得到它們。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import data as D
 from train import fit_xgboost_pipeline

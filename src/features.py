@@ -7,12 +7,17 @@ transformer 裡，放進 Pipeline 後，TimeSeriesSplit 的每一折都會各自
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
+
+# __main__ 區塊會 import data as D；data.py 用平行匯入，這行讓本檔案
+# 不論從專案根目錄或從 src/ 本身執行都找得到它。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 MISSING_RATE_THRESHOLD = 0.5
 CORRELATION_THRESHOLD = 0.95
