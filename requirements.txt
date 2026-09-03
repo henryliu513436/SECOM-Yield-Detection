@@ -1,0 +1,19 @@
+# 版本全部釘死（==），理由見 README「套件版本會影響數字」：同樣的
+# random_state 在不同版本的 numpy/xgboost/scikit-learn 下會算出不同的
+# 閾值與 PR-AUC，這裡列的版本對應 secom 環境（本專案認定的正式環境）。
+
+numpy==2.5.2
+pandas==3.0.5
+scipy==1.18.0
+scikit-learn==1.9.0
+xgboost==3.3.0
+shap==0.51.0
+matplotlib==3.11.1
+
+fastapi==0.141.1
+pydantic==2.13.5
+uvicorn==0.52.4
+
+# 測試用
+pytest==9.1.1
+httpx==0.28.1
