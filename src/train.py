@@ -10,12 +10,14 @@ TimeSeriesSplit 手寫迴圈重用同一套建構函式，讓每一折走跟單�
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import version as pkg_version
 from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import IsolationForest
@@ -28,6 +30,11 @@ from sklearn.metrics import (
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from xgboost import XGBClassifier
+
+# data.py/features.py 用平行匯入、不是套件相對匯入，這行讓本檔案不論從
+# 專案根目錄（python src/train.py、uvicorn）或從 src/ 本身執行都找得到
+# 它們。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import data as D
 from features import SecomColumnCleaner
@@ -45,6 +52,7 @@ XGB_FALLBACK_N_ESTIMATORS = 100
 XGB_THRESHOLD_MIN_PRECISION = 0.20
 
 METADATA_PATH = Path(__file__).resolve().parents[1] / "models" / "metadata.json"
+MODEL_PATH = Path(__file__).resolve().parents[1] / "models" / "model.pkl"
 _METADATA_PACKAGES = ("numpy", "pandas", "scipy", "scikit-learn", "xgboost")
 
 
@@ -394,6 +402,26 @@ def _package_versions() -> dict[str, str]:
     return versions
 
 
+def _git_commit_hash() -> str | None:
+    """目前 HEAD 的 commit hash，讓 api.py 能偵測部署的 model.pkl 是不是
+    用目前這份原始碼訓練出來的。
+
+    抓不到（例如還沒 commit、不是 git repo）就回傳 None，不能讓這個
+    附加資訊的缺失擋掉整個訓練流程。
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
 def save_production_metadata(
     X_train: pd.DataFrame,
     xgb_result: XGBFitResult,
@@ -403,7 +431,8 @@ def save_production_metadata(
     """訓練結束時輸出服務層需要的資訊，api.py 啟動時只讀這份檔案。
 
     閾值是訓練產物、不是程式碼常數——重訓一次，這裡的數字就可能跟著
-    環境或資料變動，api.py 不應該把它寫死。
+    環境或資料變動，api.py 不應該把它寫死。`git_commit` 讓 api.py 能
+    比對「載入的 model.pkl 是不是用目前這份原始碼訓練出來的」。
     """
     metadata = {
         "threshold": threshold,
@@ -411,10 +440,23 @@ def save_production_metadata(
         "n_features": len(X_train.columns),
         "scale_pos_weight": xgb_result.scale_pos_weight,
         "trained_at": datetime.now(timezone.utc).isoformat(),
+        "git_commit": _git_commit_hash(),
         "package_versions": _package_versions(),
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def save_production_model(pipeline: Pipeline, explainer, output_path: Path = MODEL_PATH) -> None:
+    """把 production pipeline 跟 SHAP explainer 一起存檔，api.py 啟動時
+    直接載入，不重新訓練。
+
+    explainer 也要一起存，是因為它的背景資料集（訓練集）在部署環境不
+    一定存在——production 環境不會有訓練資料，部署的模型必須就是被
+    評估過的那一個，不能靠重新訓練來湊出一個「應該一樣」的模型。
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump({"pipeline": pipeline, "explainer": explainer}, output_path)
 
 
 if __name__ == "__main__":
@@ -457,3 +499,9 @@ if __name__ == "__main__":
         save_production_metadata(X_train, xgb_result, threshold)
         print()
         print(f"已寫入 {METADATA_PATH}（threshold={threshold:.4f}）")
+
+        from explain import build_explainer  # 延遲匯入，避免跟 explain.py 循環匯入
+
+        explainer = build_explainer(xgb_result.pipeline, background=X_train)
+        save_production_model(xgb_result.pipeline, explainer)
+        print(f"已寫入 {MODEL_PATH}")

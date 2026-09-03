@@ -1,34 +1,39 @@
 """FastAPI 服務：健康檢查、預測、SHAP 解釋三個端點。
 
-服務層不寫死任何訓練產物數字——閾值、特徵清單這些東西是訓練出來的，
-不是程式碼常數，一律從 `python train.py` 產生的 models/metadata.json
-讀。這樣重訓一次（甚至換一套套件版本重訓，見 README「套件版本會影響
-數字」章節）之後，這支程式完全不用改。
-
-模型本身（清理 pipeline + XGBoost）在服務啟動時 fit 一次，快取在
-app.state 裡；之後每個請求重用同一個已訓練好的物件，不重新訓練、不碰
-測試集。SHAP explainer 的背景資料集同樣是訓練集，一併在啟動時建好。
+服務層不寫死任何訓練產物數字，也不在啟動時重新訓練——production 環境
+預期沒有 data/raw/uci-secom.csv，部署的模型必須就是 `python train.py`
+訓練、CV 評估過的那一個，不能靠「重新跑一次應該長得差不多」的模型代
+替。啟動時直接載入 models/model.pkl（pipeline + SHAP explainer）與
+models/metadata.json（閾值、特徵清單...），並比對 metadata 裡記錄的
+git commit 是不是目前這份原始碼；不一致只印警告、不擋啟動，因為多數
+程式碼修改（例如改文件字串）不影響模型本身，要不要重訓是人的判斷。
 """
 
 import json
 import logging
+import subprocess
+import sys
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List, Optional
 
+import joblib
 import pandas as pd
 from fastapi import FastAPI
 from pydantic import BaseModel, Field, field_validator
 
-import data as D
-from explain import build_explainer, explain_instance
-from train import fit_xgboost_pipeline
+# explain.py 用平行匯入、不是套件相對匯入，這行讓本檔案不論從專案根
+# 目錄（uvicorn src.api:app）或從 src/ 本身執行都找得到它。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from explain import explain_instance
 
 logger = logging.getLogger("secom_api")
 logging.basicConfig(level=logging.INFO)
 
 METADATA_PATH = Path(__file__).resolve().parents[1] / "models" / "metadata.json"
+MODEL_PATH = Path(__file__).resolve().parents[1] / "models" / "model.pkl"
 
 
 def load_metadata(path: Path = METADATA_PATH) -> dict:
@@ -48,30 +53,65 @@ DECISION_THRESHOLD: float = _METADATA["threshold"]
 FEATURE_NAMES: tuple[str, ...] = tuple(_METADATA["feature_names"])
 
 
+def _current_git_commit() -> str | None:
+    """跟 train.py 的 _git_commit_hash 同一套邏輯，用來跟 metadata 記錄的版本比對。"""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
+def warn_if_stale_model(metadata: dict) -> None:
+    """model.pkl 是訓練當下的產物，原始碼後來可能改了但沒有重新訓練。
+
+    只印警告、不擋啟動：多數修改不影響模型本身，擋啟動反而妨礙開發，
+    要不要重訓是人的判斷，不是這支程式該擅自決定的事。兩邊有任一個
+    抓不到 commit（例如 metadata 是舊版產生的、或這裡不是 git repo）
+    就跳過比對，不誤報。
+    """
+    trained_commit = metadata.get("git_commit")
+    current_commit = _current_git_commit()
+    if trained_commit is None or current_commit is None:
+        return
+    if trained_commit != current_commit:
+        logger.warning(
+            "models/model.pkl 是在 commit %s 訓練的，目前程式碼是 %s，"
+            "模型可能已經過期，建議重新執行 `python train.py`。",
+            trained_commit[:12],
+            current_commit[:12],
+        )
+
+
 class ModelState:
-    """啟動時建立、請求時唯讀重用的模型與 SHAP explainer。"""
+    """啟動時載入、請求時唯讀重用的模型與 SHAP explainer。"""
 
     def __init__(self, pipeline, explainer) -> None:
         self.pipeline = pipeline
         self.explainer = explainer
 
 
-def load_model_state() -> ModelState:
-    """訓練 production pipeline 並建立 SHAP explainer，服務啟動時只呼叫一次。"""
-    csv_path = Path(__file__).resolve().parents[1] / "data" / "raw" / "uci-secom.csv"
-    raw = D.load_raw(csv_path)
-    split = D.split_by_time(raw)
-    X_train = D.extract_features(split.train)
-    y_train = D.extract_labels(split.train)
+def load_model_state(path: Path = MODEL_PATH) -> ModelState:
+    """從 model.pkl 載入 production pipeline 與 SHAP explainer。
 
-    xgb_result = fit_xgboost_pipeline(X_train, y_train)
-    explainer = build_explainer(xgb_result.pipeline, background=X_train)
-    return ModelState(xgb_result.pipeline, explainer)
+    不重新訓練——見本檔案開頭的說明。
+    """
+    if not path.is_file():
+        raise FileNotFoundError(f"找不到 {path}，請先執行 `python train.py` 產生它")
+    bundle = joblib.load(path)
+    return ModelState(bundle["pipeline"], bundle["explainer"])
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("啟動中：訓練 production 模型與 SHAP explainer...")
+    warn_if_stale_model(_METADATA)
+    logger.info("啟動中：載入 %s...", MODEL_PATH)
     app.state.model = load_model_state()
     logger.info("模型就緒。")
     yield
@@ -115,8 +155,15 @@ class ExplainResponse(BaseModel):
 
 
 def _request_to_frame(request: PredictRequest) -> pd.DataFrame:
-    """把請求裡的原始感測器欄組成一列 DataFrame，欄名對齊 metadata 記錄的訓練欄位順序。"""
-    return pd.DataFrame([request.features], columns=list(FEATURE_NAMES))
+    """把請求裡的原始感測器欄組成一列 DataFrame，欄名對齊 metadata 記錄的訓練欄位順序。
+
+    只有一列時，若某欄剛好是 null，pandas 會把該欄整欄推斷成 object
+    dtype（不是 float64+NaN），fillna 之後仍是 object，XGBoost 會直接
+    拒絕預測。實測會在真的有缺失值的請求上炸掉，`.astype(float)` 強制
+    轉型才能保證欄位一定是數值型別。
+    """
+    frame = pd.DataFrame([request.features], columns=list(FEATURE_NAMES))
+    return frame.astype(float)
 
 
 @app.get("/health")

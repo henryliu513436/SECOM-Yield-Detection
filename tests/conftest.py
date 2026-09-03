@@ -12,23 +12,25 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 METADATA_PATH = Path(__file__).resolve().parents[1] / "models" / "metadata.json"
+MODEL_PATH = Path(__file__).resolve().parents[1] / "models" / "model.pkl"
 
 
 def pytest_configure(config) -> None:
-    """`api.py` 在匯入時就讀 models/metadata.json，缺檔案會直接匯入失敗。
-
-    metadata.json 是 `python train.py` 的訓練產物、不進 git，全新環境
-    第一次跑測試時通常還沒有，這裡在測試蒐集前補跑一次訓練把它生出
-    來，測試套件才能不靠手動步驟自己跑得起來。
+    """`api.py` 在匯入/啟動時分別要讀 metadata.json 跟 model.pkl，兩個
+    缺一個都會失敗。這兩個都是 `python train.py` 的訓練產物、不進
+    git，全新環境第一次跑測試時通常還沒有，這裡在測試蒐集前補跑一次
+    訓練把它們生出來，測試套件才能不靠手動步驟自己跑得起來。
     """
-    if METADATA_PATH.is_file():
+    if METADATA_PATH.is_file() and MODEL_PATH.is_file():
         return
 
     import data as D
+    from explain import build_explainer
     from train import (
         XGB_THRESHOLD_MIN_PRECISION,
         fit_xgboost_pipeline,
         save_production_metadata,
+        save_production_model,
         select_threshold_at_min_precision,
     )
 
@@ -43,3 +45,6 @@ def pytest_configure(config) -> None:
         xgb_result.val_labels, xgb_result.val_scores, XGB_THRESHOLD_MIN_PRECISION
     )
     save_production_metadata(X_train, xgb_result, threshold)
+
+    explainer = build_explainer(xgb_result.pipeline, background=X_train)
+    save_production_model(xgb_result.pipeline, explainer)
