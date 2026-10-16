@@ -106,7 +106,7 @@ def split_by_time(frame: pd.DataFrame, train_ratio: float = TRAIN_RATIO) -> Time
 
 
 def format_split_report(split: TimeSplit) -> str:
-    """切分結果報告，含 CLAUDE.md 要求的測試集 Fail 數量警告。"""
+    """切分結果報告，含測試集 Fail 數量過少的警告。"""
     train_labels = extract_labels(split.train)
     test_labels = extract_labels(split.test)
 

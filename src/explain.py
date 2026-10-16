@@ -25,7 +25,7 @@ from sklearn.pipeline import Pipeline
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import data as D
-from train import fit_xgboost_pipeline
+from train import fit_xgboost_pipeline, load_production_params
 
 TOP_N_FEATURES = 5
 
@@ -136,7 +136,7 @@ if __name__ == "__main__":
     X_train = D.extract_features(split.train)
     y_train = D.extract_labels(split.train)
 
-    xgb_result = fit_xgboost_pipeline(X_train, y_train)
+    xgb_result = fit_xgboost_pipeline(X_train, y_train, load_production_params())
     pipeline = xgb_result.pipeline
 
     explainer = build_explainer(pipeline, background=X_train)

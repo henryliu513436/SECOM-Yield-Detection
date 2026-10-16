@@ -1,4 +1,4 @@
-"""CLAUDE.md 階段6指定的 API 測試：欄位數錯誤要回 422。
+"""API 測試：欄位數錯誤要回 422。
 
 刻意不用 `with TestClient(app) as client:`，讓 lifespan（訓練 production
 模型）不會被觸發——欄位數驗證發生在 Pydantic 這一層，比進到 endpoint、

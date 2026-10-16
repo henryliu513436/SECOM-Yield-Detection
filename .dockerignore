@@ -1,0 +1,10 @@
+.git
+data/
+models/
+notebooks/
+reports/
+tests/
+**/__pycache__
+.pytest_cache
+.DS_Store
+*.md

@@ -1,0 +1,65 @@
+# 用法（models/ 與 data/secom.db 已隨 repo 提供；重新訓練見 README）：
+#   ollama serve                         # 本機的 Ollama（Ollama App 開著就有）
+#   docker compose up -d api             # 啟動推論 API 容器
+#   docker compose run --rm agent        # 進入互動式 agent CLI
+#
+# 為什麼預設用本機的 Ollama：macOS 上 Docker 跑在 Linux 虛擬機裡，容器
+# 用不到 Apple 的 Metal GPU，gemma4:e4b 在容器裡只能用 CPU，會慢好幾倍。
+# 在有 NVIDIA GPU 的 Linux 機器上，可以改用容器版 Ollama：
+#   OLLAMA_BASE_URL=http://ollama:11434 docker compose --profile ollama up -d
+#   OLLAMA_BASE_URL=http://ollama:11434 docker compose run --rm agent
+
+services:
+  api:
+    build: .
+    command: ["uvicorn", "src.api:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/app/models:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      retries: 30
+
+  # agent 與 MCP server 在同一個容器：MCP server 是 agent 用 stdio 啟動的
+  # 子程序，不是獨立的網路服務。
+  agent:
+    build: .
+    command: ["python", "src/agent.py"]
+    stdin_open: true
+    tty: true
+    profiles: ["cli"]
+    environment:
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:e4b}
+      SECOM_API_BASE_URL: http://api:8000
+    volumes:
+      - ./models:/app/models:ro
+      - ./data:/app/data
+    depends_on:
+      api:
+        condition: service_healthy
+
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["ollama"]
+    volumes:
+      - ollama-models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      retries: 30
+
+  ollama-pull:
+    image: ollama/ollama:latest
+    profiles: ["ollama"]
+    environment:
+      OLLAMA_HOST: ollama:11434
+    entrypoint: ["ollama", "pull", "${OLLAMA_MODEL:-gemma4:e4b}"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+
+volumes:
+  ollama-models:

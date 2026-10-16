@@ -1,10 +1,15 @@
 """模型建構、交叉驗證與閾值選擇：IsolationForest（非監督）與 XGBoost（監督）。
 
-模型建構函式照 CLAUDE.md 規定的參數把模型建起來、正確 fit；CV 部分用
+模型建構函式照專案規格的參數把模型建起來、正確 fit；CV 部分用
 TimeSeriesSplit 手寫迴圈重用同一套建構函式，讓每一折走跟單次訓練完全
-相同的路徑（含早停）。閾值選擇與 confusion matrix 全部只用訓練集內部
-的資料（production 模型自己的早停驗證尾端），不觸碰測試集——測試集
-的最終評估是後續、待確認閾值之後才做的事。
+相同的路徑。XGBoost 的 learning_rate × n_estimators 由 CV 從事先宣告
+的小網格選出；閾值選擇與 confusion matrix 只用 production 模型自己的
+閾值尾端（訓練集最後 20%，不參與 fit），不觸碰測試集。
+
+為什麼不用早停：舊版用同一段尾端（219 筆、只有 14 個 Fail）做早停，
+aucpr 在這麼少的正樣本上雜訊極大，production 模型在第 5 棵樹就停了，
+CV ROC-AUC 只有 0.535。改成由 CV 決定樹數後，尾端也不再「先決定樹數、
+又拿來選閾值」被用兩次。
 """
 
 from __future__ import annotations
@@ -12,7 +17,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from importlib.metadata import version as pkg_version
 from pathlib import Path
@@ -43,13 +48,10 @@ RANDOM_SEED = 42
 ISOLATION_FOREST_CONTAMINATION = 0.07
 
 XGB_MAX_DEPTH = 3
-XGB_MAX_ESTIMATORS = 500
-XGB_EARLY_STOPPING_ROUNDS = 20
-XGB_EVAL_METRIC = "aucpr"
-EARLY_STOP_TAIL_FRACTION = 0.2
-MIN_EARLY_STOP_TAIL_SIZE = 50
-XGB_FALLBACK_N_ESTIMATORS = 100
+THRESHOLD_TAIL_FRACTION = 0.2
+MIN_THRESHOLD_TAIL_SIZE = 50
 XGB_THRESHOLD_MIN_PRECISION = 0.20
+SELECTION_N_SPLITS = 5
 
 METADATA_PATH = Path(__file__).resolve().parents[1] / "models" / "metadata.json"
 MODEL_PATH = Path(__file__).resolve().parents[1] / "models" / "model.pkl"
@@ -89,62 +91,52 @@ def build_isolation_forest_pipeline(
 
 
 @dataclass(frozen=True)
-class XGBFitResult:
-    """fit_xgboost_pipeline 的回傳值，除了模型還帶著降級資訊與早停驗證集。
+class XGBParams:
+    """CV 網格裡的一組超參數。max_depth 固定為 XGB_MAX_DEPTH，不進網格。"""
 
-    val_scores/val_labels 是早停驗證尾端的預測分數與真實標籤，用來給
-    閾值選擇使用；用固定樹數的降級路徑沒有早停驗證集，兩者為 None。
+    learning_rate: float
+    n_estimators: int
+
+
+# 網格在看到任何 CV 結果之前就宣告好，刻意保持很小（6 組）：組數愈多，
+# 「挑出來的那組 CV 分數」被選擇偏差灌水得愈嚴重。
+XGB_PARAM_GRID: tuple[XGBParams, ...] = tuple(
+    XGBParams(lr, n) for lr in (0.03, 0.1) for n in (100, 300, 600)
+)
+
+
+@dataclass(frozen=True)
+class XGBFitResult:
+    """fit_xgboost_pipeline 的回傳值，除了模型還帶著閾值尾端的預測。
+
+    val_scores/val_labels 是閾值尾端（不參與 fit）的預測分數與真實標籤，
+    用來給閾值選擇使用；尾端剛好沒有 Fail 時無法選閾值，兩者為 None。
     """
 
     pipeline: Pipeline
-    used_early_stopping: bool
-    n_estimators: int
+    params: XGBParams
     scale_pos_weight: float
     val_labels: np.ndarray | None
     val_scores: np.ndarray | None
 
 
-def _fit_xgboost_with_early_stopping(
+def _fit_xgboost(
     X_fit: pd.DataFrame,
     y_fit: pd.Series,
-    X_val: pd.DataFrame,
-    y_val: pd.Series,
+    params: XGBParams,
     scale_pos_weight: float,
     random_state: int,
 ) -> XGBClassifier:
-    """早停路徑：用 eval_set 決定實際樹數。
+    """固定樹數訓練，不早停。
 
     n_jobs=1 是刻意的：預設會用滿所有核心跑 hist 演算法的直方圖建構，
-    多執行緒之間浮點數加總的順序不保證每次執行都相同，即使 random_state
-    固定，不同次執行仍可能選出不同的早停樹數。單執行緒才能保證每次執行
-    位元級一致。
+    多執行緒之間浮點數加總的順序不保證每次執行都相同，單執行緒才能保證
+    每次執行位元級一致。
     """
     model = XGBClassifier(
         max_depth=XGB_MAX_DEPTH,
-        n_estimators=XGB_MAX_ESTIMATORS,
-        scale_pos_weight=scale_pos_weight,
-        early_stopping_rounds=XGB_EARLY_STOPPING_ROUNDS,
-        eval_metric=XGB_EVAL_METRIC,
-        random_state=random_state,
-        n_jobs=1,
-    )
-    model.fit(X_fit, y_fit, eval_set=[(X_val, y_val)], verbose=False)
-    return model
-
-
-def _fit_xgboost_fixed_estimators(
-    X_fit: pd.DataFrame,
-    y_fit: pd.Series,
-    scale_pos_weight: float,
-    random_state: int,
-) -> XGBClassifier:
-    """降級路徑：早停尾端沒有任何 Fail，早停沒有意義，改用固定樹數。
-
-    同樣固定 n_jobs=1，理由見 _fit_xgboost_with_early_stopping。
-    """
-    model = XGBClassifier(
-        max_depth=XGB_MAX_DEPTH,
-        n_estimators=XGB_FALLBACK_N_ESTIMATORS,
+        learning_rate=params.learning_rate,
+        n_estimators=params.n_estimators,
         scale_pos_weight=scale_pos_weight,
         random_state=random_state,
         n_jobs=1,
@@ -156,43 +148,37 @@ def _fit_xgboost_fixed_estimators(
 def fit_xgboost_pipeline(
     X: pd.DataFrame,
     y: pd.Series,
-    tail_fraction: float = EARLY_STOP_TAIL_FRACTION,
+    params: XGBParams,
+    tail_fraction: float = THRESHOLD_TAIL_FRACTION,
     random_state: int = RANDOM_SEED,
 ) -> XGBFitResult:
-    """在 X/y 上 fit 清理 + XGBoost，早停驗證集從尾端切一塊。
+    """在 X/y 上 fit 清理 + XGBoost，尾端切一塊只拿來選閾值。
 
-    尾端大小是 tail_fraction 與 MIN_EARLY_STOP_TAIL_SIZE 兩者取大，
-    避免資料量小的折切出來的尾端小到沒有代表性。如果尾端剛好沒有任何
-    Fail，代表早停這個機制在這一折沒有意義，改用固定的
-    XGB_FALLBACK_N_ESTIMATORS 棵樹，不假裝早停在運作，也沒有驗證集
-    可以拿來選閾值。
+    尾端大小是 tail_fraction 與 MIN_THRESHOLD_TAIL_SIZE 兩者取大。模型只
+    在尾端之前的資料上 fit，尾端的預測分數對這個模型來說是完全沒看過的
+    資料，且跟部署時同一個模型、同一個分數尺度。
     """
     cleaner = SecomColumnCleaner()
     X_clean = cleaner.fit_transform(X)
 
-    tail_size = max(int(len(X_clean) * tail_fraction), MIN_EARLY_STOP_TAIL_SIZE)
+    tail_size = max(int(len(X_clean) * tail_fraction), MIN_THRESHOLD_TAIL_SIZE)
     cut = len(X_clean) - tail_size
     if cut < 1:
-        raise ValueError(f"訓練資料只有 {len(X_clean)} 筆，不足以切出早停尾端")
+        raise ValueError(f"訓練資料只有 {len(X_clean)} 筆，不足以切出閾值尾端")
 
-    tail_has_fail = int(y.iloc[cut:].sum()) > 0
+    X_fit, X_val = X_clean.iloc[:cut], X_clean.iloc[cut:]
+    y_fit, y_val = y.iloc[:cut], y.iloc[cut:]
+    weight = compute_scale_pos_weight(y_fit)
+    model = _fit_xgboost(X_fit, y_fit, params, weight, random_state)
 
-    if tail_has_fail:
-        X_fit, X_val = X_clean.iloc[:cut], X_clean.iloc[cut:]
-        y_fit, y_val = y.iloc[:cut], y.iloc[cut:]
-        weight = compute_scale_pos_weight(y_fit)
-        model = _fit_xgboost_with_early_stopping(X_fit, y_fit, X_val, y_val, weight, random_state)
-        n_estimators_used = model.best_iteration + 1
+    if int(y_val.sum()) > 0:
         val_labels = y_val.to_numpy()
         val_scores = model.predict_proba(X_val)[:, 1]
     else:
-        weight = compute_scale_pos_weight(y)
-        model = _fit_xgboost_fixed_estimators(X_clean, y, weight, random_state)
-        n_estimators_used = XGB_FALLBACK_N_ESTIMATORS
         val_labels, val_scores = None, None
 
     pipeline = Pipeline([("clean", cleaner), ("model", model)])
-    return XGBFitResult(pipeline, tail_has_fail, n_estimators_used, weight, val_labels, val_scores)
+    return XGBFitResult(pipeline, params, weight, val_labels, val_scores)
 
 
 def _report_isolation_forest(pipeline: Pipeline, X: pd.DataFrame) -> str:
@@ -206,13 +192,12 @@ def _report_isolation_forest(pipeline: Pipeline, X: pd.DataFrame) -> str:
 
 
 def _report_xgboost(result: XGBFitResult) -> str:
-    """回報用的 scale_pos_weight、是否用了早停，以及實際樹數與驗證分數。"""
-    if result.used_early_stopping:
-        best_score = result.pipeline.named_steps["model"].best_score
-        status = f"早停選出 {result.n_estimators} 棵樹，驗證集最佳 {XGB_EVAL_METRIC}={best_score:.4f}"
-    else:
-        status = f"未使用早停（尾端無 Fail），改用固定 {result.n_estimators} 棵樹"
-    return f"XGBoost：scale_pos_weight={result.scale_pos_weight:.2f}，{status}"
+    """回報用的 scale_pos_weight 與實際使用的超參數。"""
+    p = result.params
+    return (
+        f"XGBoost：scale_pos_weight={result.scale_pos_weight:.2f}，"
+        f"learning_rate={p.learning_rate}，n_estimators={p.n_estimators}"
+    )
 
 
 @dataclass(frozen=True)
@@ -229,8 +214,6 @@ class FoldResult:
     xgb_ratio: float
     iso_roc_auc: float
     xgb_roc_auc: float
-    xgb_used_early_stopping: bool
-    xgb_n_estimators: int
 
 
 def _ratio_to_baseline(pr_auc: float, baseline: float) -> float:
@@ -270,7 +253,7 @@ def _score_fold(
     return iso_scores, xgb_scores
 
 
-def run_cv(X: pd.DataFrame, y: pd.Series, n_splits: int) -> list[FoldResult]:
+def run_cv(X: pd.DataFrame, y: pd.Series, n_splits: int, params: XGBParams) -> list[FoldResult]:
     """對 X/y 跑 TimeSeriesSplit(n_splits)，兩個模型都重用階段3的建構函式。
 
     每折獨立呼叫 build_isolation_forest_pipeline / fit_xgboost_pipeline，
@@ -288,9 +271,7 @@ def run_cv(X: pd.DataFrame, y: pd.Series, n_splits: int) -> list[FoldResult]:
             continue
 
         iso_pipeline = build_isolation_forest_pipeline(fold_train_X)
-        xgb_result = fit_xgboost_pipeline(fold_train_X, fold_train_y)
-        if not xgb_result.used_early_stopping:
-            print(f"  折{fold}：早停尾端 Fail=0，未使用早停，改用固定 {xgb_result.n_estimators} 棵樹")
+        xgb_result = fit_xgboost_pipeline(fold_train_X, fold_train_y, params)
         if int(fold_val_y.sum()) == 0:
             print(f"  折{fold}：驗證折 Fail=0，PR-AUC/ROC-AUC 無意義，記為 NaN")
 
@@ -311,12 +292,57 @@ def run_cv(X: pd.DataFrame, y: pd.Series, n_splits: int) -> list[FoldResult]:
                 xgb_ratio=_ratio_to_baseline(xgb_pr_auc, baseline),
                 iso_roc_auc=_safe_roc_auc(fold_val_y, iso_scores),
                 xgb_roc_auc=_safe_roc_auc(fold_val_y, xgb_scores),
-                xgb_used_early_stopping=xgb_result.used_early_stopping,
-                xgb_n_estimators=xgb_result.n_estimators,
             )
         )
 
     return results
+
+
+@dataclass(frozen=True)
+class ParamSelectionRow:
+    """網格中一組超參數的 CV 結果。"""
+
+    params: XGBParams
+    mean_pr_auc_ratio: float
+    mean_roc_auc: float
+
+
+def select_xgb_params(
+    X: pd.DataFrame,
+    y: pd.Series,
+    n_splits: int = SELECTION_N_SPLITS,
+    grid: tuple[XGBParams, ...] = XGB_PARAM_GRID,
+) -> tuple[XGBParams, list[ParamSelectionRow]]:
+    """在訓練集上用時間序列 CV 評估網格，回傳「PR-AUC 相對基準線倍數」
+    平均最高的那組，以及完整的比較表。
+
+    主指標用倍數而不是絕對 PR-AUC，理由跟 format_cv_report 一樣：各折
+    基準線差距很大，絕對值無法跨折平均。平手時取網格裡較前面的一組。
+    注意被選中那組的 CV 分數帶有選擇偏差，會略為樂觀。
+    """
+    table: list[ParamSelectionRow] = []
+    for params in grid:
+        results = run_cv(X, y, n_splits, params)
+        table.append(
+            ParamSelectionRow(
+                params=params,
+                mean_pr_auc_ratio=float(np.nanmean([r.xgb_ratio for r in results])),
+                mean_roc_auc=float(np.nanmean([r.xgb_roc_auc for r in results])),
+            )
+        )
+    best = max(table, key=lambda row: row.mean_pr_auc_ratio)
+    return best.params, table
+
+
+def format_selection_report(table: list[ParamSelectionRow], best: XGBParams) -> str:
+    lines = ["learning_rate  n_estimators  PR-AUC倍數  ROC-AUC"]
+    for row in table:
+        mark = "  ← 選用" if row.params == best else ""
+        lines.append(
+            f"  {row.params.learning_rate:<12} {row.params.n_estimators:<13} "
+            f"{row.mean_pr_auc_ratio:.2f}x      {row.mean_roc_auc:.3f}{mark}"
+        )
+    return "\n".join(lines)
 
 
 def _format_summary(label: str, values: list[float], n_total: int) -> str:
@@ -330,12 +356,11 @@ def format_cv_report(results: list[FoldResult], n_splits: int) -> str:
     """逐折結果表格（含相對基準線倍數），附上跨折 mean ± std。"""
     lines = [f"TimeSeriesSplit(n_splits={n_splits})："]
     for r in results:
-        flag = "" if r.xgb_used_early_stopping else "（未早停）"
         lines.append(
             f"  折{r.fold}: train={r.train_size:>4} val={r.val_size:>4} "
             f"baseline={r.baseline:.3f}  "
             f"IsoForest={r.iso_pr_auc:.3f}({r.iso_ratio:.2f}x)  "
-            f"XGB={r.xgb_pr_auc:.3f}({r.xgb_ratio:.2f}x){flag}"
+            f"XGB={r.xgb_pr_auc:.3f}({r.xgb_ratio:.2f}x)"
         )
 
     n = len(results)
@@ -378,7 +403,7 @@ def _confusion_report(y_true: np.ndarray, predicted: np.ndarray, label: str) -> 
 def format_threshold_report(y_true: np.ndarray, scores: np.ndarray, threshold: float) -> str:
     """在給定閾值下的 XGBoost confusion matrix，用來檢視閾值實際的操作點。
 
-    這裡的資料是 production 模型自己的早停驗證尾端，不是測試集。
+    這裡的資料是 production 模型自己的閾值尾端，不是測試集。
     """
     predicted = (scores >= threshold).astype(int)
     return _confusion_report(y_true, predicted, f"XGBoost（閾值={threshold:.4f}）")
@@ -422,10 +447,22 @@ def _git_commit_hash() -> str | None:
         return None
 
 
+def summarize_cv(results: list[FoldResult]) -> dict:
+    """把選定超參數的 CV 結果濃縮成幾個數字，寫進 metadata 供下游（例如
+    agent 工具）誠實回報模型可信度，不在別處寫死。"""
+    return {
+        "n_splits": len(results),
+        "xgb_pr_auc_ratio_mean": float(np.nanmean([r.xgb_ratio for r in results])),
+        "xgb_roc_auc_mean": float(np.nanmean([r.xgb_roc_auc for r in results])),
+        "xgb_roc_auc_std": float(np.nanstd([r.xgb_roc_auc for r in results])),
+    }
+
+
 def save_production_metadata(
     X_train: pd.DataFrame,
     xgb_result: XGBFitResult,
     threshold: float,
+    cv_summary: dict,
     output_path: Path = METADATA_PATH,
 ) -> None:
     """訓練結束時輸出服務層需要的資訊，api.py 啟動時只讀這份檔案。
@@ -439,6 +476,8 @@ def save_production_metadata(
         "feature_names": list(X_train.columns),
         "n_features": len(X_train.columns),
         "scale_pos_weight": xgb_result.scale_pos_weight,
+        "xgb_params": asdict(xgb_result.params),
+        "cv_summary": cv_summary,
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "git_commit": _git_commit_hash(),
         "package_versions": _package_versions(),
@@ -459,6 +498,45 @@ def save_production_model(pipeline: Pipeline, explainer, output_path: Path = MOD
     joblib.dump({"pipeline": pipeline, "explainer": explainer}, output_path)
 
 
+def load_production_params(path: Path = METADATA_PATH) -> XGBParams:
+    """讀出 production 模型實際使用的超參數，給需要重建同一個模型的腳本
+    （explain.py、plot_presentation_charts.py）使用，不在各處重複選參。"""
+    if not path.is_file():
+        raise FileNotFoundError(f"找不到 {path}，請先執行 `python src/train.py`")
+    metadata = json.loads(path.read_text(encoding="utf-8"))
+    if "xgb_params" not in metadata:
+        raise ValueError(f"{path} 是舊版 metadata（沒有 xgb_params），請重新執行 `python src/train.py`")
+    return XGBParams(**metadata["xgb_params"])
+
+
+@dataclass(frozen=True)
+class ProductionTraining:
+    """train_production 的完整產物，main 與 tests/conftest.py 共用。"""
+
+    xgb_result: XGBFitResult
+    selection_table: list[ParamSelectionRow]
+    cv_results: list[FoldResult]
+    threshold: float | None
+
+
+def train_production(X_train: pd.DataFrame, y_train: pd.Series) -> ProductionTraining:
+    """選參 → 用選中的參數 fit production 模型 → 在閾值尾端選閾值。
+
+    尾端沒有 Fail 時 threshold 為 None，由呼叫端決定怎麼處理（main 會拒
+    絕寫出 metadata），不在這裡偷偷補一個預設值。
+    """
+    best, table = select_xgb_params(X_train, y_train)
+    xgb_result = fit_xgboost_pipeline(X_train, y_train, best)
+    cv_results = run_cv(X_train, y_train, SELECTION_N_SPLITS, best)
+
+    threshold = None
+    if xgb_result.val_scores is not None:
+        threshold = select_threshold_at_min_precision(
+            xgb_result.val_labels, xgb_result.val_scores, XGB_THRESHOLD_MIN_PRECISION
+        )
+    return ProductionTraining(xgb_result, table, cv_results, threshold)
+
+
 if __name__ == "__main__":
     csv_path = Path(__file__).resolve().parents[1] / "data" / "raw" / "uci-secom.csv"
 
@@ -467,28 +545,30 @@ if __name__ == "__main__":
     X_train = D.extract_features(split.train)
     y_train = D.extract_labels(split.train)
 
-    iso_pipeline = build_isolation_forest_pipeline(X_train)
-    xgb_result = fit_xgboost_pipeline(X_train, y_train)
-
     print(f"訓練集：{len(X_train)} 筆，Fail={int(y_train.sum())}")
+    print()
+    print(f"=== XGBoost 超參數選擇（TimeSeriesSplit({SELECTION_N_SPLITS})，只用訓練集）===")
+    training = train_production(X_train, y_train)
+    xgb_result = training.xgb_result
+    print(format_selection_report(training.selection_table, xgb_result.params))
+
+    iso_pipeline = build_isolation_forest_pipeline(X_train)
     print()
     print(_report_isolation_forest(iso_pipeline, X_train))
     print(_report_xgboost(xgb_result))
 
-    for n_splits in (5, 4):
-        print()
-        cv_results = run_cv(X_train, y_train, n_splits=n_splits)
-        print(format_cv_report(cv_results, n_splits))
+    print()
+    print(format_cv_report(training.cv_results, SELECTION_N_SPLITS))
+    print()
+    print(format_cv_report(run_cv(X_train, y_train, 4, xgb_result.params), 4))
 
     print()
-    print("=== 閾值選擇（用 production 模型自己的早停驗證尾端，不碰測試集）===")
-    if xgb_result.val_scores is None:
-        print("這次訓練沒有可用的早停驗證集（尾端無 Fail），無法選閾值。")
+    print("=== 閾值選擇（用 production 模型自己的閾值尾端，不碰測試集）===")
+    if training.threshold is None:
+        print("閾值尾端沒有任何 Fail，無法選閾值。")
         print(f"{METADATA_PATH} 不會被寫入——沒有閾值就無法產生完整的服務層 metadata。")
     else:
-        threshold = select_threshold_at_min_precision(
-            xgb_result.val_labels, xgb_result.val_scores, XGB_THRESHOLD_MIN_PRECISION
-        )
+        threshold = training.threshold
         print(f"precision >= {XGB_THRESHOLD_MIN_PRECISION:.0%} 條件下選出的閾值：{threshold:.4f}")
         print(format_threshold_report(xgb_result.val_labels, xgb_result.val_scores, threshold))
 
@@ -496,7 +576,7 @@ if __name__ == "__main__":
         X_val_tail, y_val_tail = X_train.iloc[-tail_size:], y_train.iloc[-tail_size:]
         print(format_isolation_forest_confusion(iso_pipeline, X_val_tail, y_val_tail))
 
-        save_production_metadata(X_train, xgb_result, threshold)
+        save_production_metadata(X_train, xgb_result, threshold, summarize_cv(training.cv_results))
         print()
         print(f"已寫入 {METADATA_PATH}（threshold={threshold:.4f}）")
 

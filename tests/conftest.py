@@ -26,13 +26,7 @@ def pytest_configure(config) -> None:
 
     import data as D
     from explain import build_explainer
-    from train import (
-        XGB_THRESHOLD_MIN_PRECISION,
-        fit_xgboost_pipeline,
-        save_production_metadata,
-        save_production_model,
-        select_threshold_at_min_precision,
-    )
+    from train import save_production_metadata, save_production_model, summarize_cv, train_production
 
     csv_path = Path(__file__).resolve().parents[1] / "data" / "raw" / "uci-secom.csv"
     raw = D.load_raw(csv_path)
@@ -40,11 +34,12 @@ def pytest_configure(config) -> None:
     X_train = D.extract_features(split.train)
     y_train = D.extract_labels(split.train)
 
-    xgb_result = fit_xgboost_pipeline(X_train, y_train)
-    threshold = select_threshold_at_min_precision(
-        xgb_result.val_labels, xgb_result.val_scores, XGB_THRESHOLD_MIN_PRECISION
+    training = train_production(X_train, y_train)
+    if training.threshold is None:
+        raise RuntimeError("閾值尾端沒有 Fail，無法產生 metadata")
+    save_production_metadata(
+        X_train, training.xgb_result, training.threshold, summarize_cv(training.cv_results)
     )
-    save_production_metadata(X_train, xgb_result, threshold)
 
-    explainer = build_explainer(xgb_result.pipeline, background=X_train)
-    save_production_model(xgb_result.pipeline, explainer)
+    explainer = build_explainer(training.xgb_result.pipeline, background=X_train)
+    save_production_model(training.xgb_result.pipeline, explainer)
