@@ -20,7 +20,7 @@ the agent proposes must be approved by a human.
 
 ---
 
-## 1. Data and the honest framing
+## 1. Data: strong drift, so the model is only a ranking aid
 
 [UCI SECOM](https://archive.ics.uci.edu/dataset/179/secom): 1567 production
 lots, 590 anonymized sensor readings each, 6.6% Fail. The CSV is included in
@@ -286,9 +286,8 @@ npx @modelcontextprotocol/inspector python src/mcp_server.py
 
 ### Retrain from scratch
 
-The raw data is already in `data/raw/uci-secom.csv` (SECOM with `Time` and
-`Pass/Fail` columns, the format of the
-[Kaggle copy](https://www.kaggle.com/datasets/paultimothymooney/uci-semcom)):
+The raw data is already in `data/raw/uci-secom.csv` — the UCI SECOM data in
+one CSV: a `Time` column, the 590 sensor columns, and `Pass/Fail`:
 
 ```bash
 python src/train.py                     # → models/model.pkl, models/metadata.json
